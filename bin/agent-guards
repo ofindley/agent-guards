@@ -1,0 +1,73 @@
+#!/bin/bash
+# agent-guards — front door for memguard and diskguard.
+#
+#   agent-guards settings [--port N] [--no-open]   Open the settings page (local only, Ctrl+C to stop)
+#   agent-guards check                               Memory and disk level (exit = worst: 0 OK, 1 WARN, 2 CRITICAL)
+#   agent-guards status                              Full memory and disk status
+#   agent-guards config                              Show the config file path and contents
+#   agent-guards watch                               One watchdog tick (memguard watch + diskguard watch)
+#   agent-guards watchdog install|uninstall|status   Optional macOS launchd watchdog (every 10 min)
+
+# Resolve this script's real folder, even through symlinks.
+src=$0
+while [ -L "$src" ]; do
+  link=$(readlink "$src")
+  case "$link" in /*) src=$link ;; *) src=$(dirname "$src")/$link ;; esac
+done
+BIN=$(cd "$(dirname "$src")" && pwd)
+ROOT=$(dirname "$BIN")
+CONFIG=${AGENT_GUARDS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/agent-guards/config.json}
+LABEL=com.agent-guards.watch
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+
+case "${1:-help}" in
+  settings)
+    shift
+    command -v python3 >/dev/null 2>&1 || { echo "The settings page needs python3. Or edit $CONFIG by hand (see config.example.json)." >&2; exit 1; }
+    exec python3 "$ROOT/settings/server.py" --bin "$BIN" "$@"
+    ;;
+  check)
+    m=$("$BIN/memguard" check); mc=$?
+    d=$("$BIN/diskguard" check); dc=$?
+    echo "memory: $m"; echo "disk:   $d"
+    [ $mc -gt $dc ] && exit $mc; exit $dc
+    ;;
+  status) "$BIN/memguard" status; echo; echo "----"; echo; "$BIN/diskguard" status ;;
+  config)
+    echo "$CONFIG"
+    if [ -f "$CONFIG" ]; then cat "$CONFIG"; else echo "(not created yet: defaults in use, see $ROOT/config.example.json)"; fi
+    ;;
+  watch) "$BIN/memguard" watch; "$BIN/diskguard" watch ;;
+  watchdog)
+    case "$2" in
+      install)
+        [ "$(uname)" = Darwin ] || { echo "The launchd watchdog is macOS only. On Linux, add 'agent-guards watch' to cron every 10 minutes." >&2; exit 1; }
+        mkdir -p "$HOME/Library/LaunchAgents" "$HOME/.local/state/agent-guards"
+        # launchd doesn't inherit your shell's env, so the config path is written into the plist.
+        case "$CONFIG" in /*) ;; *) CONFIG="$PWD/$CONFIG" ;; esac
+        nl='
+'
+        case "$BIN$HOME$CONFIG" in *"$nl"*) echo "Can't install: a path contains a line break." >&2; exit 1 ;; esac
+        # Escape for XML first (& < >), then for the sed replacement (\ | &).
+        esc() { local v=$1; v=${v//&/"&amp;"}; v=${v//</"&lt;"}; v=${v//>/"&gt;"}; printf '%s' "$v" | sed -e 's/[\\|&]/\\&/g'; }
+        tmp=$(mktemp "${TMPDIR:-/tmp}/agent-guards-plist.XXXXXX") || exit 1
+        if ! sed -e "s|__AGENT_GUARDS_BIN__|$(esc "$BIN")|g" -e "s|__HOME__|$(esc "$HOME")|g" \
+                 -e "s|__AGENT_GUARDS_CONFIG__|$(esc "$CONFIG")|g" "$ROOT/launchd/$LABEL.plist" > "$tmp" ||
+           ! plutil -lint "$tmp" >/dev/null 2>&1 ||
+           [ "$(plutil -extract ProgramArguments.1 raw -o - "$tmp" 2>/dev/null)" != "$BIN/agent-guards" ]; then
+          rm -f "$tmp"; echo "Can't install: couldn't build the watchdog file for these paths. Nothing was changed." >&2; exit 1
+        fi
+        launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+        mv "$tmp" "$PLIST"
+        launchctl bootstrap "gui/$(id -u)" "$PLIST" &&
+          echo "Watchdog installed: runs now and every 10 minutes, using $CONFIG ($PLIST)"
+        ;;
+      uninstall)
+        launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+        rm -f "$PLIST" && echo "Watchdog removed."
+        ;;
+      *) launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | grep -E 'state|last exit' || echo "Watchdog not installed." ;;
+    esac
+    ;;
+  *) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//' ;;
+esac

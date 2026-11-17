@@ -1,0 +1,22 @@
+{
+  "memory": {
+    "warn_used_pct": 80,
+    "block_used_pct": 90,
+    "use_macos_pressure": true,
+    "orphan_min_age_min": 30,
+    "stale_orphan_age_min": 240
+  },
+  "disk": {
+    "unit": "gb",
+    "warn_free": 50,
+    "block_free": 20
+  },
+  "cleanup": {
+    "auto_clean": true,
+    "project_dirs": "~/Documents, ~/Projects, ~/code, ~/dev",
+    "next_cache_idle_days": 3,
+    "node_modules_idle_days": 0,
+    "xcode_derived_data_days": 7,
+    "keep_browser_versions": 2
+  }
+}

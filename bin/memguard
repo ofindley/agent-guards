@@ -1,0 +1,378 @@
+#!/bin/bash
+# memguard — memory safeguard for AI coding agents (Claude Code, Codex, scripts).
+#
+#   memguard status        Memory level, swap, biggest apps, orphaned dev processes
+#   memguard check         Prints OK / WARN / CRITICAL. Exit 0 / 1 / 2
+#   memguard json          Current readings and limits as JSON (used by the settings page)
+#   memguard orphans       List orphaned dev servers/renderers (the session that started them is gone)
+#   memguard clean [-n]    Stop orphaned dev process trees (-n = dry run)
+#   memguard hook          Claude Code PreToolUse hook (reads hook JSON on stdin)
+#   memguard watch         Watchdog tick (run by launchd every few minutes)
+#
+# Limits come from ~/.config/agent-guards/config.json (edit with: agent-guards settings).
+# Env vars override the file: MEMGUARD_WARN_USED_PCT  MEMGUARD_BLOCK_USED_PCT  MEMGUARD_USE_PRESSURE (1/0)
+#                             MEMGUARD_ORPHAN_MIN_AGE_MIN  MEMGUARD_STALE_AGE_MIN (0 = never auto-stop)
+# Bypass a single command:   MEMGUARD_OVERRIDE=1 <command>     Turn the hook off: MEMGUARD_OFF=1
+
+# Where these scripts live, so messages show a command that works even if bin/ isn't on PATH.
+case "$0" in */*) SELF_DIR=$(cd "${0%/*}" 2>/dev/null && pwd) ;; *) SELF_DIR=$PWD ;; esac
+case "$SELF_DIR" in "$HOME"/*) G="~${SELF_DIR#"$HOME"}" ;; *) G=$SELF_DIR ;; esac
+CONFIG=${AGENT_GUARDS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/agent-guards/config.json}
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/agent-guards
+LOG="$STATE_DIR/memguard.log"
+mkdir -p "$STATE_DIR"
+
+if ! command -v jq >/dev/null 2>&1 && ! command -v plutil >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
+  [ "$1" = hook ] || [ "$1" = watch ] || echo "memguard: jq or python3 isn't installed, so your settings can't be read and the hook lets every command through." >&2
+fi
+
+# cfg <keypath> <default>: read a number or true/false from the config file.
+cfg() {
+  local v=""
+  if [ -f "$CONFIG" ]; then
+    v=$(json_get "$1" < "$CONFIG")
+  fi
+  if [ "$3" = bool ]; then case "$v" in true) v=1 ;; false) v=0 ;; *) v=$2 ;; esac; echo "$v"; return; fi
+  case "$v" in ''|*[!0-9.]*|*.*.*) v=$2 ;; esac   # true/false are not numbers
+  echo "$v"
+}
+# json_get <keypath>: read one value from JSON on stdin (false stays "false"; missing = empty).
+json_get() {
+  if command -v jq >/dev/null 2>&1; then jq -r ".$1 | if . == null then empty else . end" 2>/dev/null
+  elif command -v plutil >/dev/null 2>&1; then plutil -extract "$1" raw -o - - 2>/dev/null
+  elif command -v python3 >/dev/null 2>&1; then python3 -c '
+import json, sys
+v = json.load(sys.stdin)
+for k in sys.argv[1].split("."):
+    v = v.get(k) if isinstance(v, dict) else None
+if v is not None: print(str(v).lower() if isinstance(v, bool) else v)' "$1" 2>/dev/null
+  else
+    :   # no JSON reader: defaults apply (see the one-time warning below)
+  fi
+}
+# int_or <value> <default> <min>: whole number >= min, else the default.
+int_or() { case "$1" in ''|*[!0-9]*|???????*) echo "$2" ;; *) if [ "$1" -lt "$3" ]; then echo "$2"; else echo "$1"; fi ;; esac; }
+
+WARN_USED=${MEMGUARD_WARN_USED_PCT:-$(cfg memory.warn_used_pct 80)}
+BLOCK_USED=${MEMGUARD_BLOCK_USED_PCT:-$(cfg memory.block_used_pct 90)}
+USE_PRESSURE=${MEMGUARD_USE_PRESSURE:-$(cfg memory.use_macos_pressure 1 bool)}
+ORPHAN_MIN_AGE_MIN=${MEMGUARD_ORPHAN_MIN_AGE_MIN:-$(cfg memory.orphan_min_age_min 30)}
+STALE_AGE_MIN=${MEMGUARD_STALE_AGE_MIN:-$(cfg memory.stale_orphan_age_min 240)}
+# Every number is checked after env vars and the file are merged; bad values fall back to defaults.
+WARN_USED=$(int_or "${WARN_USED%.*}" 80 1); BLOCK_USED=$(int_or "${BLOCK_USED%.*}" 90 1)
+ORPHAN_MIN_AGE_MIN=$(int_or "$ORPHAN_MIN_AGE_MIN" 30 1); STALE_AGE_MIN=$(int_or "$STALE_AGE_MIN" 240 0)
+case "$USE_PRESSURE" in 1|true) USE_PRESSURE=1 ;; *) USE_PRESSURE=0 ;; esac
+
+# Dev tooling that is safe to stop once its launching session is gone (parent is launchd / init, or
+# the user's systemd on Linux). Never add system services, databases, or user apps here.
+# Note: a job you start on purpose with nohup or & and then close the terminal looks the same.
+# Raise stale_orphan_age_min (or set it to 0) if you run long renders that way.
+# Matched against the start of the full command line, so a word that only appears in a file name or
+# argument (vim next-server.md, a folder called remotion-site) never counts. Each rule names the
+# program itself: browsers that Puppeteer/Playwright downloaded, ffmpeg, headless Godot, Next.js's
+# server, python -m http.server, and node/bun running a dev tool from node_modules.
+ORPHAN_RE='^[^ ]*/(\.cache/puppeteer|ms-playwright)/|^([^ ]*/)?ffmpeg( |$)|^([^ ]*/)?[Gg]odot[^ /]*( [^ ]+)* --headless( |$)|^next-server( |$)|^([^ ]*/)?[Pp]ython[0-9.]*( -[A-Za-z]+)* -m http\.server( |$)|^([^ ]*/)?(node|bun)( -[^ ]+)* [^ ]*node_modules/(\.bin/)?(next|vite|webpack|webpack-dev-server|astro|storybook|start-storybook|remotion|tsx|nodemon|esbuild|playwright)(/[^ ]*)?( |$)|^([^ ]*/)?esbuild .* --serve|^(npm|pnpm|yarn|bun) (run )?(dev|start|serve|storybook|preview)( |$)'
+
+
+# ---- readings (macOS first, Linux fallback) ----
+pressure_level() {  # macOS kernel pressure: 1 normal, 2 warn, 4 critical
+  sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null || echo 1
+}
+used_pct() {
+  local f
+  f=$(sysctl -n kern.memorystatus_level 2>/dev/null)
+  if [ -n "$f" ]; then echo $((100 - f)); return; fi
+  if [ -r /proc/meminfo ]; then
+    awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{if(t>0) printf "%d", 100-(a*100/t); else print 0}' /proc/meminfo
+    return
+  fi
+  echo 0
+}
+total_gb() {
+  local b; b=$(sysctl -n hw.memsize 2>/dev/null)
+  if [ -n "$b" ]; then awk -v b="$b" 'BEGIN{printf "%d", b/1073741824 + 0.5}'
+  else awk '/^MemTotal:/{printf "%d", $2/1048576 + 0.5}' /proc/meminfo 2>/dev/null; fi
+}
+swap_line() {
+  local s; s=$(sysctl -n vm.swapusage 2>/dev/null)
+  if [ -n "$s" ]; then echo "$s" | awk '{print "swap " $6 " used of " $3}'
+  elif [ -r /proc/meminfo ]; then
+    awk '/^SwapTotal:/{t=$2} /^SwapFree:/{f=$2} END{printf "swap %dM used of %dM", (t-f)/1024, t/1024}' /proc/meminfo
+  else echo "swap unknown"; fi
+}
+
+state() {
+  local p u; p=$(pressure_level); u=$(used_pct)
+  [ "$USE_PRESSURE" = 1 ] || p=1
+  if [ "$p" -ge 4 ] || [ "$u" -ge "$BLOCK_USED" ]; then echo CRITICAL
+  elif [ "$p" -ge 2 ] || [ "$u" -ge "$WARN_USED" ]; then echo WARN
+  else echo OK; fi
+}
+
+summary() {
+  local p extra=""; p=$(pressure_level)
+  if [ "$USE_PRESSURE" = 1 ] && [ "$p" -ge 2 ]; then extra=", macOS reports memory pressure"; fi
+  echo "$(state): $(used_pct)% memory used (warn at ${WARN_USED}%, block at ${BLOCK_USED}%)$extra, $(swap_line), $(total_gb) GB RAM"
+}
+
+# etime ([[dd-]hh:]mm:ss) -> minutes
+etime_awk='function mins(e,  d,h,m,n,a){d=0; if(index(e,"-")){split(e,a,"-");d=a[1];e=a[2]} n=split(e,a,":"); if(n==3){h=a[1];m=a[2]}else{h=0;m=a[1]} return d*1440+h*60+m}'
+
+# Orphan roots: own processes reparented to init/launchd whose command matches ORPHAN_RE.
+orphan_parents() {  # pid 1, plus the user's own systemd on Linux (orphans are reparented there)
+  echo 1; command -v pgrep >/dev/null 2>&1 && [ "$(uname)" = Linux ] && pgrep -u "$(id -u)" -x systemd 2>/dev/null
+}
+my_ancestors() {  # this script's own pid and every parent up to launchd/init
+  local p=$$
+  while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null; do echo "$p"; p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' '); done
+}
+orphan_roots() {  # orphan_roots <min-age-minutes>
+  local mine; mine=" $(my_ancestors | tr '\n' ' ')"
+  ps -U "$(id -u)" -o pid=,ppid=,etime=,command= | awk -v re="$ORPHAN_RE" -v min="${1:-$ORPHAN_MIN_AGE_MIN}" -v parents=" $(orphan_parents | tr '\n' ' ')" -v mine="$mine " "$etime_awk"'
+    index(parents, " " $2 " ") && !index(mine, " " $1 " ") {
+      cmd=$0; sub(/^ *[0-9]+ +[0-9]+ +[^ ]+ +/,"",cmd)
+      if (cmd ~ re && mins($3) >= min) print $1 }' |
+  while IFS= read -r pid; do   # never stop a tree that contains this script or whatever called it
+    case " $(descendants "$pid" | tr '\n' ' ')" in *" $$ "*|*" $PPID "*) continue ;; esac
+    echo "$pid"
+  done
+}
+
+descendants() {  # pid -> pid + all descendants
+  ps -axo pid=,ppid= | awk -v root="$1" '{kids[$2]=kids[$2] " " $1} END{q=root; while(q!=""){split(q,a," "); q=""; for(i in a){print a[i]; q=q kids[a[i]]}}}'
+}
+
+tree_mb() { local t=0 p r; for p in $(descendants "$1"); do r=$(ps -o rss= -p "$p" 2>/dev/null); t=$((t + ${r:-0})); done; echo $((t/1024)); }
+
+list_orphans() {
+  local pid
+  for pid in $(orphan_roots "$ORPHAN_MIN_AGE_MIN"); do
+    printf "  pid %-6s %5s MB  up %-12s %s\n" "$pid" "$(tree_mb "$pid")" "$(ps -o etime= -p "$pid" | tr -d ' ')" "$(ps -o command= -p "$pid" | cut -c1-110)"
+  done
+}
+
+clean() {  # clean <dry 0|1> <min-age-minutes>
+  local dry=$1 age=$2 pid n=0 kids all=""
+  for pid in $(orphan_roots "$age"); do
+    kids=$(descendants "$pid" | tr '\n' ' ')
+    if [ "$dry" = 1 ]; then echo "would stop $pid ($(ps -o command= -p "$pid" | cut -c1-90)) tree: $kids"
+    else
+      echo "$(date '+%F %T') clean: stopping $pid tree [$kids] $(ps -o command= -p "$pid" | cut -c1-120)" >> "$LOG"
+      # shellcheck disable=SC2086
+      kill $kids 2>/dev/null; n=$((n+1)); all="$all $kids"
+    fi
+  done
+  if [ "$dry" != 1 ]; then
+    if [ $n -gt 0 ]; then
+      sleep 2
+      # Anything from those trees that ignored the polite stop (only processes we listed above).
+      # shellcheck disable=SC2086
+      for pid in $all; do kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null; done
+    fi
+    echo "stopped $n orphaned process tree(s)"
+  fi
+}
+
+top_apps() {  # resident memory summed per app, top 12
+  ps -axo rss=,comm= | awk '{
+      rss=$1; $1=""; c=$0; sub(/^ /,"",c)
+      if (c ~ /\.app\//) { sub(/\.app\/.*/,"",c); n=split(c,a,"/"); c=a[n] } else { n=split(c,a,"/"); c=a[n] }
+      sub(/ Helper.*/,"",c); m[c]+=rss; k[c]++ }
+    END { for (c in m) printf "%8d MB  %3d procs  %s\n", m[c]/1024, k[c], c }' | sort -rn | head -12
+}
+
+notify() {  # rate-limited desktop notification: notify <key> <minutes> <message>
+  local stamp="$STATE_DIR/mem-notify-$1" now; now=$(date +%s)
+  if [ $((now - $(read_stamp "$stamp"))) -lt $(($2 * 60)) ]; then return; fi
+  echo "$now" > "$stamp"
+  if command -v osascript >/dev/null 2>&1; then
+    osascript -e "display notification \"$3\" with title \"memguard\"" >/dev/null 2>&1
+  elif command -v notify-send >/dev/null 2>&1; then
+    notify-send memguard "$3" >/dev/null 2>&1
+  fi
+}
+
+json_str() { python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$1" 2>/dev/null || { local s=$1; s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\t'/\\t}; s=${s//$'\n'/\\n}; s=${s//$'\r'/}; printf '"%s"' "$s"; }; }
+read_stamp() { local v; v=$(cat "$1" 2>/dev/null); case "$v" in ''|*[!0-9]*) echo 0 ;; *) echo "$v" ;; esac; }
+# read_hook: sets TOOL and CMD from the hook JSON on stdin
+read_hook() { local input; input=$(cat); TOOL=$(printf '%s' "$input" | json_get tool_name); CMD=$(printf '%s' "$input" | json_get tool_input.command); }
+# ---- command matching (shared by memguard and diskguard; keep both copies identical) ----
+# segments <command> <override-var>: prints one simple command per line, normalised for matching.
+#  - splits on ; && || | & ( ) { } and newlines, but never inside quotes or comments
+#  - skips heredoc bodies (unless they're fed to a shell), so commit messages and notes don't count
+#  - drops leading VAR=x, sudo/env/time/nohup/nice/timeout/caffeinate/xargs/watch/arch, then/do/else/!
+#  - "bash -c '...'" and "eval '...'" are unwrapped and checked too
+#  - quoted text is blanked and redirections like 2>/dev/null are removed
+#  - a segment that starts with <override-var>=1 is dropped (that's the per-command override);
+#    "export <override-var>=1" drops everything after it
+segments() {
+  local depth=${3:-0} line
+  [ "$depth" -gt 3 ] && return
+  printf '%s\n' "${1:0:65536}" | awk -v sq="'" -v ov="$2" '
+  function strip_prefixes(s,   again) {
+    again = 1
+    while (again) {
+      again = 0
+      if (match(s, "^[A-Za-z_][A-Za-z0-9_]*=(\"[^\"]*\"|" sq "[^" sq "]*" sq "|[^ ]*)( |$)")) {
+        if (substr(s, 1, RLENGTH) ~ ("^" ov "=1( |$)")) overridden = 1
+        s = substr(s, RLENGTH + 1); again = 1; continue
+      }
+      if (match(s, /^(sudo|env)( -[^ ]+)* /) || match(s, /^(time|nohup|exec|command|builtin|then|do|else|!) /) ||
+          match(s, /^nice( -n ?-?[0-9]+| -[0-9]+)? /) || match(s, /^timeout( -[^ ]+)* [0-9.]+[smhd]? /) ||
+          match(s, /^caffeinate( -[a-z]+)* /) || match(s, /^xargs( -[IinPLsdE] [^- ][^ ]*| -[0-9A-Za-z]+)* /) ||
+          match(s, /^watch( -n ?[0-9.]+| -[a-z]+)* /) || match(s, /^arch -[a-z0-9_]+ /) || match(s, /^stdbuf( -[^ ]+)* /)) {
+        s = substr(s, RLENGTH + 1); again = 1
+      }
+    }
+    return s
+  }
+  function emit(s,   sp, w, rest, inner) {
+    gsub(/[ \t]+/, " ", s); sub(/^ /, "", s); sub(/ $/, "", s)
+    overridden = 0
+    if (s ~ ("^export " ov "=1( |$)")) { all_off = 1; return }
+    s = strip_prefixes(s)
+    if (overridden || all_off || s == "") return
+    # bash -c "..." / sh -c / zsh -lc / eval "...": check what runs inside
+    if (match(s, /^(\/[^ ]*\/)?(ba|z|da|k)?sh( -[a-z]+)* -[a-z]*c /) || match(s, /^eval /)) {
+      inner = substr(s, RLENGTH + 1)
+      if (inner ~ ("^[\"" sq "]")) { q1 = substr(inner, 1, 1); inner = substr(inner, 2); sub("[" q1 "][^" q1 "]*$", "", inner) }
+      gsub(/\n/, " ", inner); print "@@R " inner; return
+    }
+    # blank quoted text, drop redirections that do not write big files
+    gsub("\"[^\"]*\"", "\"\"", s); gsub(sq "[^" sq "]*" sq, sq sq, s)
+    gsub(/ ?[0-9]*>&[0-9-]+/, "", s); gsub(/ ?([0-9]*|&)>>? ?\/dev\/null/, "", s); gsub(/ ?2>>? ?[^ ]+/, "", s)
+    gsub(/ -[A-Za-z]*[oO] ?(\/dev\/null|-)( |$)/, " ", s); gsub(/ --output[ =](\/dev\/null|-)( |$)/, " ", s)
+    sub(/ $/, "", s)
+    sp = index(s, " "); w = (sp ? substr(s, 1, sp - 1) : s); rest = (sp ? substr(s, sp) : "")
+    sub(/.*\//, "", w); print w rest
+  }
+  { gsub(/\r/, ""); lines[++nl] = $0 }
+  END {
+    # pass 1: drop heredoc bodies unless a shell reads them
+    buf = ""
+    for (i = 1; i <= nl; i++) {
+      l = lines[i]; buf = buf (buf == "" && i == 1 ? "" : "\n") l
+      if (match(l, "<<-?[ \t]*[\"" sq "]?[A-Za-z_][A-Za-z0-9_]*[\"" sq "]?") && substr(l, RSTART + 2, 1) != "<") {
+        d = substr(l, RSTART, RLENGTH); dash = (d ~ /^<<-/); gsub(/^<<-?[ \t]*/, "", d); gsub("[\"" sq "]", "", d)
+        keep = (l ~ /(^|[;&|( ]|\/)(ba|z|da|k)?sh( |$)/)
+        for (i++; i <= nl; i++) {
+          b = lines[i]; t = b; if (dash) sub(/^\t+/, "", t)
+          if (t == d) break
+          if (keep) buf = buf "\n" b
+        }
+      }
+    }
+    # pass 2: split outside quotes and comments
+    q = ""; cur = ""; n = length(buf)
+    for (i = 1; i <= n; i++) {
+      c = substr(buf, i, 1)
+      if (q != "") {
+        if (c == q) q = ""
+        else if (c == "\\" && q == "\"") { cur = cur c substr(buf, i + 1, 1); i++; continue }
+        else if (c == "\n") c = " "
+        cur = cur c; continue
+      }
+      if (c == sq || c == "\"") { q = c; cur = cur c; continue }
+      if (c == "\\") { nx = substr(buf, i + 1, 1); cur = cur (nx == "\n" ? " " : nx); i++; continue }
+      if (c == "#" && (cur == "" || substr(cur, length(cur), 1) ~ /[ \t]/)) { while (i < n && substr(buf, i + 1, 1) != "\n") i++; continue }
+      if (c == "$" && substr(buf, i + 1, 1) == "(") { emit(cur); cur = ""; i++; continue }
+      if (index(";&|(){}`\n", c)) { emit(cur); cur = ""; continue }
+      cur = cur c
+    }
+    emit(cur)
+  }' | while IFS= read -r line; do
+    case "$line" in "@@R "*) segments "${line#@@R }" "$2" $((depth + 1)) ;; *) printf '%s\n' "$line" ;; esac
+  done
+}
+# Global flags allowed between a tool and its verb, e.g. npm --prefix web install, git -C dir clone.
+GF='( -[^ ]+( [^- ][^ ]*)?)*'
+# Read-only forms of heavy tools: version/help/dry-run/listing never count.
+LIGHT_RE='^[^ ]+( [^ -][^ ]*)? (-v|-V|--version|-version|--help|-h|-help)$| --dry-run( |$)|^(make (-n|--dry-run|clean|help)|unzip -[lZ]|git lfs (ls-files|status|env|version)|xcodebuild -(list|showsdks|version)|gradlew? (tasks|--version)|uv pip (list|show|freeze)|pip[0-9.]* (list|show|freeze)|npx kill-port|docker compose (down|stop|ps|logs|config|ls)|docker-compose (down|stop|ps|logs|config))( |$)'
+# is_heavy <command> <heavy-regex> <override-var>
+is_heavy() {
+  segments "$1" "$3" | sort -u | grep -E -- "$2" | grep -Evq -- "$LIGHT_RE"
+}
+# Commands that start heavy work. Only checked when memory is above a limit.
+HEAVY_RE="^(godot|Godot|npm$GF (run|start|exec|test|x|create)|npx|pnpm$GF (run|dev|start|test|build|exec|dlx|create)|yarn$GF (run|dev|start|test|build|dlx|create)|yarn workspace [^ ]+ (run|dev|start|test|build)|bun$GF (run|dev|test|build|x|create|[^ ]+[.](ts|tsx|js|jsx|mjs|cjs))|bunx|node( -[^ ]+)* [^- \"'][^ ]*|python[0-9.]*( -[A-Za-z]+)* ([^- \"'][^ ]*|-m [^ ]+)|uv run|tsx|ts-node|ffmpeg|xcodebuild|gradlew?|cargo (build|run|test)|go (build|run|test)|tsc|jest|vitest|docker (run|build|compose (up|run|build)|buildx build)|docker-compose (up|run|build)|playwright|vite|next (dev|build|start)|remotion|swift (build|run|test)|make|pytest|uvicorn|gunicorn|webpack|esbuild|ollama run)( |$)"
+
+case "${1:-status}" in
+  status)
+    summary
+    echo "Config: $CONFIG$([ -f "$CONFIG" ] || echo ' (not created yet, using defaults)')"
+    echo; echo "Biggest apps (resident memory):"; top_apps
+    echo; echo "Orphaned dev processes (parent gone, > ${ORPHAN_MIN_AGE_MIN} min):"
+    o=$(list_orphans); echo "${o:-  none}"
+    [ -n "$o" ] && echo "  -> stop them with: $G/memguard clean"
+    ;;
+  check)
+    s=$(state); echo "$s"; [ "$s" = OK ] && exit 0; [ "$s" = WARN ] && exit 1; exit 2 ;;
+  json)
+    printf '{"level":"%s","used_pct":%s,"total_gb":%s,"pressure":%s,"warn_used_pct":%s,"block_used_pct":%s,"use_macos_pressure":%s,"orphans":%s,"config":%s}\n' \
+      "$(state)" "$(used_pct)" "$(total_gb)" "$(pressure_level)" "$WARN_USED" "$BLOCK_USED" \
+      "$([ "$USE_PRESSURE" = 1 ] && echo true || echo false)" "$(orphan_roots "$ORPHAN_MIN_AGE_MIN" | wc -l | tr -d ' ')" "$(json_str "$CONFIG")"
+    ;;
+  orphans) o=$(list_orphans); echo "${o:-No orphaned dev processes.}" ;;
+  clean)
+    [ $# -gt 2 ] && { echo "memguard clean: too many options (use -n or --dry-run to preview)" >&2; exit 64; }
+    [ $# -eq 2 ] && [ -z "$2" ] && { echo "memguard clean: empty option" >&2; exit 64; }
+    case "$2" in
+      "") clean 0 "$ORPHAN_MIN_AGE_MIN" ;;
+      -n|--dry-run) o=$(clean 1 "$ORPHAN_MIN_AGE_MIN"); echo "${o:-No orphaned dev processes to stop.}" ;;
+      *) echo "memguard clean: unknown option '$2' (use -n or --dry-run to preview)" >&2; exit 64 ;;
+    esac ;;
+  hook)
+    [ -n "$MEMGUARD_OFF" ] && exit 0
+    s=$(state); [ "$s" = OK ] && exit 0
+    read_hook
+    [ -z "$CMD" ] && exit 0
+    case "$TOOL" in ""|Bash) ;; *) exit 0 ;; esac
+    cmd=$CMD
+    is_heavy "$cmd" "$HEAVY_RE" MEMGUARD_OVERRIDE || exit 0
+    if [ "$s" = CRITICAL ]; then
+      echo "$(date '+%F %T') hook: blocked [$(echo "$cmd" | head -1 | cut -c1-120)] — $(summary)" >> "$LOG"
+      cat >&2 <<EOF
+memguard BLOCKED this command: $(summary).
+Starting more heavy work now risks freezing the machine. Before retrying:
+  1. Run $G/memguard status to see what is using memory.
+  2. Stop servers/background jobs you started that are no longer needed; run $G/memguard clean for orphaned dev processes.
+  3. Retry once memory is no longer CRITICAL. Only if the user explicitly says to proceed anyway, prefix the command with MEMGUARD_OVERRIDE=1.
+EOF
+      exit 2
+    fi
+    # WARN: remind the agent at most once every 10 minutes.
+    stamp="$STATE_DIR/mem-warn"; now=$(date +%s)
+    if [ $((now - $(read_stamp "$stamp"))) -ge 600 ]; then
+      echo "$now" > "$stamp"
+      orphans=$(orphan_roots "$ORPHAN_MIN_AGE_MIN" | wc -l | tr -d ' ')
+      msg="memguard WARNING — $(summary). Avoid starting additional servers, renders, or parallel agents; reuse what is running and stop processes you no longer need."
+      [ "$orphans" -gt 0 ] && msg="$msg $orphans orphaned dev process tree(s) are running — tell the user and suggest $G/memguard clean."
+      printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":%s}}\n' "$(json_str "$msg")"
+    fi
+    exit 0
+    ;;
+  watch)
+    s=$(state)
+    # Orphans older than the stale age are stopped at any memory level (0 = never).
+    if [ "$STALE_AGE_MIN" -gt 0 ]; then
+      stale=$(orphan_roots "$STALE_AGE_MIN" | wc -l | tr -d ' ')
+      if [ "$stale" -gt 0 ]; then
+        echo "$(date '+%F %T') watch: stopping $stale orphan(s) older than ${STALE_AGE_MIN} min" >> "$LOG"
+        clean 0 "$STALE_AGE_MIN" >> "$LOG"
+      fi
+    fi
+    [ "$s" = OK ] && exit 0
+    echo "$(date '+%F %T') watch: $(summary)" >> "$LOG"
+    n=$(orphan_roots "$ORPHAN_MIN_AGE_MIN" | wc -l | tr -d ' ')
+    if [ "$s" = CRITICAL ]; then
+      { echo "$(date '+%F %T') watch: top apps"; top_apps; } >> "$LOG"
+      [ "$n" -gt 0 ] && clean 0 "$ORPHAN_MIN_AGE_MIN" >> "$LOG"
+      notify critical 10 "Memory CRITICAL ($(used_pct)% used). Stopped $n orphaned dev process tree(s). Close unused apps or sessions."
+    else
+      [ "$n" -gt 0 ] && notify warn-orphans 120 "Memory WARN. $n orphaned dev server(s) running — run: $G/memguard clean"
+    fi
+    [ "$(wc -l < "$LOG")" -gt 5000 ] && tail -2000 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+    exit 0
+    ;;
+  -h|--help|help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 64 ;;
+esac

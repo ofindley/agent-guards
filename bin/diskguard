@@ -1,0 +1,480 @@
+#!/bin/bash
+# diskguard — disk-space safeguard for AI coding agents (Claude Code, Codex, scripts).
+#
+#   diskguard status          Free space, level, and what cleanup would reclaim
+#   diskguard check           Prints OK / WARN / CRITICAL. Exit 0 / 1 / 2
+#   diskguard json            Current readings and limits as JSON (used by the settings page)
+#   diskguard clean [-n]      Remove safe, rebuildable caches (-n = dry run, shows sizes)
+#   diskguard report          Big folders worth a look. Never deleted automatically
+#   diskguard hook            Claude Code PreToolUse hook (reads hook JSON on stdin)
+#   diskguard watch           Watchdog tick (run by launchd)
+#
+# Limits come from ~/.config/agent-guards/config.json (edit with: agent-guards settings).
+# Env vars override the file: DISKGUARD_UNIT (gb|pct)  DISKGUARD_WARN  DISKGUARD_BLOCK  (free space)
+#   DISKGUARD_NEXT_IDLE_DAYS  DISKGUARD_NODE_MODULES_IDLE_DAYS (0 = off)  DISKGUARD_DERIVED_DATA_DAYS
+#   DISKGUARD_KEEP_BROWSER_VERSIONS  DISKGUARD_AUTO_CLEAN (1/0)  DISKGUARD_PROJECT_DIRS ("~/code, ~/Projects")
+# Bypass a single command:   DISKGUARD_OVERRIDE=1 <command>     Turn the hook off: DISKGUARD_OFF=1
+#
+# Cleanup only removes caches that tools rebuild on their own, plus iOS simulators that Xcode
+# already marks unavailable (their runtime is gone; this deletes them and their app data).
+# It never touches documents, source code, media, git repos, or anything outside these locations.
+
+if [ -z "$HOME" ] || [ "$HOME" = / ]; then
+  [ "$1" = hook ] && exit 0
+  echo "diskguard: HOME is not set; refusing to run." >&2; exit 1
+fi
+# Where these scripts live, so messages show a command that works even if bin/ isn't on PATH.
+case "$0" in */*) SELF_DIR=$(cd "${0%/*}" 2>/dev/null && pwd) ;; *) SELF_DIR=$PWD ;; esac
+case "$SELF_DIR" in "$HOME"/*) G="~${SELF_DIR#"$HOME"}" ;; *) G=$SELF_DIR ;; esac
+CONFIG=${AGENT_GUARDS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/agent-guards/config.json}
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/agent-guards
+LOG="$STATE_DIR/diskguard.log"
+mkdir -p "$STATE_DIR"
+# launchd runs with a bare PATH; find common package managers.
+PATH="$PATH:$HOME/.local/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+if ! command -v jq >/dev/null 2>&1 && ! command -v plutil >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
+  [ "$1" = hook ] || [ "$1" = watch ] || echo "diskguard: jq or python3 isn't installed, so your settings can't be read and the hook lets every command through." >&2
+fi
+
+# cfg <keypath> <default>: read a value from the config file (numbers, true/false, or text with "str").
+cfg() {
+  local v=""
+  if [ -f "$CONFIG" ]; then
+    v=$(json_get "$1" < "$CONFIG")
+  fi
+  if [ "$3" = str ]; then echo "${v:-$2}"; return; fi
+  case "$v" in ''|*[!0-9.]*|*.*.*) v=$2 ;; esac   # true/false are not numbers
+  echo "$v"
+}
+# json_get <keypath>: read one value from JSON on stdin (false stays "false"; missing = empty).
+json_get() {
+  if command -v jq >/dev/null 2>&1; then jq -r ".$1 | if . == null then empty else . end" 2>/dev/null
+  elif command -v plutil >/dev/null 2>&1; then plutil -extract "$1" raw -o - - 2>/dev/null
+  elif command -v python3 >/dev/null 2>&1; then python3 -c '
+import json, sys
+v = json.load(sys.stdin)
+for k in sys.argv[1].split("."):
+    v = v.get(k) if isinstance(v, dict) else None
+if v is not None: print(str(v).lower() if isinstance(v, bool) else v)' "$1" 2>/dev/null
+  else
+    :   # no JSON reader: defaults apply (see the one-time warning below)
+  fi
+}
+# int_or <value> <default> <min>: whole number >= min, else the default.
+int_or() { case "$1" in ''|*[!0-9]*|???????*) echo "$2" ;; *) if [ "$1" -lt "$3" ]; then echo "$2"; else echo "$1"; fi ;; esac; }
+# num_or <value> <default>: a plain number (decimals allowed), else the default.
+num_or() { if [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then echo "$1"; else echo "$2"; fi; }
+
+UNIT=${DISKGUARD_UNIT:-$(cfg disk.unit gb str)}
+case "$UNIT" in gb|pct) ;; *) UNIT=gb ;; esac
+if [ "$UNIT" = pct ]; then DEF_WARN=15; DEF_BLOCK=5; else DEF_WARN=50; DEF_BLOCK=20; fi
+WARN=${DISKGUARD_WARN:-$(cfg disk.warn_free "$DEF_WARN")}
+BLOCK=${DISKGUARD_BLOCK:-$(cfg disk.block_free "$DEF_BLOCK")}
+NEXT_IDLE_DAYS=${DISKGUARD_NEXT_IDLE_DAYS:-$(cfg cleanup.next_cache_idle_days 3)}
+NODE_MODULES_IDLE_DAYS=${DISKGUARD_NODE_MODULES_IDLE_DAYS:-$(cfg cleanup.node_modules_idle_days 0)}
+DERIVED_DATA_DAYS=${DISKGUARD_DERIVED_DATA_DAYS:-$(cfg cleanup.xcode_derived_data_days 7)}
+KEEP_BROWSERS=${DISKGUARD_KEEP_BROWSER_VERSIONS:-$(cfg cleanup.keep_browser_versions 2)}
+# config_ok: the settings file is a readable JSON object (if we can tell).
+config_ok() {
+  if command -v jq >/dev/null 2>&1; then jq -e 'type == "object"' "$CONFIG" >/dev/null 2>&1
+  elif command -v python3 >/dev/null 2>&1; then python3 -c 'import json,sys; sys.exit(not isinstance(json.load(open(sys.argv[1])), dict))' "$CONFIG" 2>/dev/null
+  elif command -v plutil >/dev/null 2>&1; then plutil -lint "$CONFIG" >/dev/null 2>&1
+  else return 0; fi
+}
+# Automatic cleanup stays OFF if the settings file is there but can't be read, or the value isn't true.
+if [ -n "$DISKGUARD_AUTO_CLEAN" ]; then AUTO_CLEAN=$DISKGUARD_AUTO_CLEAN
+elif [ ! -f "$CONFIG" ]; then AUTO_CLEAN=1
+elif ! config_ok; then AUTO_CLEAN=0; CONFIG_BROKEN=1
+else
+  case "$(json_get cleanup.auto_clean < "$CONFIG")" in ''|true) AUTO_CLEAN=1 ;; *) AUTO_CLEAN=0 ;; esac
+fi
+# shellcheck disable=SC2088  # the tilde is expanded below, on purpose
+PROJECT_DIRS_RAW=${DISKGUARD_PROJECT_DIRS:-$(cfg cleanup.project_dirs "~/Documents, ~/Projects, ~/code, ~/dev" str)}
+# Every number is checked here, after env vars and the file are merged. A bad value falls back
+# to the default rather than to 0, so a typo can never make "idle for N days" mean "everything".
+WARN=$(num_or "$WARN" "$DEF_WARN"); BLOCK=$(num_or "$BLOCK" "$DEF_BLOCK")
+NEXT_IDLE_DAYS=$(int_or "$NEXT_IDLE_DAYS" 3 1)
+NODE_MODULES_IDLE_DAYS=$(int_or "$NODE_MODULES_IDLE_DAYS" 0 0)
+DERIVED_DATA_DAYS=$(int_or "$DERIVED_DATA_DAYS" 7 0)
+KEEP_BROWSERS=$(int_or "$KEEP_BROWSERS" 2 1)
+case "$AUTO_CLEAN" in 1|true) AUTO_CLEAN=1 ;; *) AUTO_CLEAN=0 ;; esac
+
+# Project folders scanned for .next caches (and node_modules when enabled). Each must resolve to a
+# real folder inside $HOME; "..", symlinks out of $HOME, and $HOME itself are rejected.
+HOME_REAL=$(cd "$HOME" 2>/dev/null && pwd -P)
+if [ -z "$HOME_REAL" ] || [ "$HOME_REAL" = / ]; then
+  [ "$1" = hook ] && exit 0
+  echo "diskguard: your home folder ($HOME) doesn't exist; refusing to run." >&2; exit 1
+fi
+PROJECT_DIRS=()
+IFS=',' read -r -a _dirs <<< "$PROJECT_DIRS_RAW"
+for d in "${_dirs[@]}"; do
+  d="${d#"${d%%[![:space:]]*}"}"; d="${d%"${d##*[![:space:]]}"}"   # trim
+  # shellcheck disable=SC2088
+  case "$d" in "~") d=$HOME ;; "~/"*) d="$HOME/${d#\~/}" ;; esac
+  case "/$d/" in */../*) continue ;; esac
+  [ -d "$d" ] || continue
+  d=$(cd "$d" 2>/dev/null && pwd -P) || continue
+  case "$d" in "$HOME_REAL"/?*) PROJECT_DIRS+=("$d") ;; esac
+done
+
+
+# ---- readings ----
+df_line() { df -Pk "$HOME" | awk 'NR==2{print $2, $4}'; }   # total_kb avail_kb
+free_gb() { df_line | awk '{printf "%d", $2/1048576}'; }
+free_pct() { df_line | awk '{printf "%.1f", $2*100/$1}'; }
+total_gb() { df_line | awk '{printf "%d", $1/1048576}'; }
+free_val() { if [ "$UNIT" = pct ]; then free_pct; else free_gb; fi; }
+fmt_limit() { if [ "$UNIT" = pct ]; then echo "$1%"; else echo "$1 GB"; fi; }
+
+state() {
+  awk -v f="$(free_val)" -v w="$WARN" -v b="$BLOCK" 'BEGIN{ if (f+0 < b+0) print "CRITICAL"; else if (f+0 < w+0) print "WARN"; else print "OK" }'
+}
+summary() {
+  echo "$(state): $(free_gb) GB free of $(total_gb) GB ($(free_pct)% free; warn below $(fmt_limit "$WARN"), block below $(fmt_limit "$BLOCK"))"
+}
+human() { awk -v k="$1" 'BEGIN{ if (k>=1048576) printf "%.1f GB", k/1048576; else printf "%d MB", k/1024 }'; }
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+
+# ---- removal primitive: only rebuildable caches, logged, dry-run aware ----
+DRY=0; FREED_KB=0
+in_project_dirs() { local r; for r in "${PROJECT_DIRS[@]}"; do case "$1" in "$r"/?*) return 0 ;; esac; done; return 1; }
+zap() {  # zap <path> <reason>
+  local p="$1" kb ok=0 parent
+  [ -e "$p" ] || [ -L "$p" ] || return 0
+  if [ -L "$p" ]; then log "REFUSED (symlink): $p"; return 1; fi
+  # Resolve the real location (a symlinked cache folder must not lead outside these locations).
+  parent=$(cd "${p%/*}" 2>/dev/null && pwd -P) || { log "REFUSED (can't resolve): $p"; return 1; }
+  p="$parent/${p##*/}"
+  case "$p" in
+    "$HOME_REAL"/.cache/puppeteer/?*/?*|"$HOME_REAL"/.cache/ms-playwright/?*|"$HOME_REAL"/Library/Caches/ms-playwright/?*) ok=1 ;;
+    "$HOME_REAL"/Library/Developer/Xcode/DerivedData/?*) ok=1 ;;
+    */.next|*/node_modules) in_project_dirs "$p" && ok=1 ;;
+  esac
+  if [ "$ok" != 1 ]; then log "REFUSED (not a known cache location): $p"; return 1; fi
+  kb=$(du -sk "$p" 2>/dev/null | cut -f1); kb=${kb:-0}
+  FREED_KB=$((FREED_KB + kb))
+  if [ "$DRY" = 1 ]; then printf "  %9s  %s  (%s)\n" "$(human "$kb")" "${p/#$HOME_REAL/~}" "$2"
+  else rm -rf "$p" && log "removed $(human "$kb") $p ($2)"; fi
+}
+is_busy() {  # is_busy <project> <busy dirs>: a dev process runs in it, inside it, or in a folder above it
+  local b r
+  while IFS= read -r b; do
+    [ -n "$b" ] || continue
+    [ "$b" = "$HOME_REAL" ] && continue
+    for r in "${PROJECT_DIRS[@]}"; do [ "$b" = "$r" ] && continue 2; done   # a shell sitting in ~/code doesn't count
+    case "$1" in "$b"|"$b"/*) return 0 ;; esac
+    case "$b" in "$1"/*) return 0 ;; esac
+  done <<< "$2"
+  return 1
+}
+in_git_repo() {  # in_git_repo <dir>: there's a .git here or in a parent folder below $HOME
+  local d=$1
+  while [ -n "$d" ] && [ "$d" != "$HOME_REAL" ] && [ "$d" != / ]; do [ -e "$d/.git" ] && return 0; d=${d%/*}; done
+  return 1
+}
+
+busy_dirs() {  # working directories of running node/bun/python processes (dev servers)
+  lsof -a -d cwd -c node -c bun -c next -c Python -c python3 -Fn 2>/dev/null | sed -n 's/^n//p' | sort -u
+}
+clean_next_caches() {  # Next.js .next build folders in idle projects (next build/dev recreates them)
+  [ "${#PROJECT_DIRS[@]}" -gt 0 ] || return 0
+  local busy d proj recent; busy=$(busy_dirs)
+  while IFS= read -r d; do
+    proj=$(dirname "$d")
+    grep -q '"next" *: *"' "$proj/package.json" 2>/dev/null || continue  # only real Next.js projects
+    # ...and only a folder Next.js actually built (it always writes one of these)
+    [ -e "$d/BUILD_ID" ] || [ -e "$d/build-manifest.json" ] || [ -d "$d/cache" ] || [ -d "$d/server" ] || [ -d "$d/static" ] || [ -e "$d/trace" ] || continue
+    is_busy "$proj" "$busy" && continue                                    # dev server running there
+    recent=$(find "$d" -mtime -"$NEXT_IDLE_DAYS" -print -quit 2>/dev/null) || continue  # can't tell: skip
+    [ -n "$recent" ] && continue                                          # used recently
+    zap "$d" "Next.js build cache, idle ${NEXT_IDLE_DAYS}d+"
+  done < <(find "${PROJECT_DIRS[@]}" -maxdepth 6 -type d -name .next -not -path '*/node_modules/*' -prune 2>/dev/null)
+}
+idle_project() {  # true if no file (outside deps/build/git) changed in NODE_MODULES_IDLE_DAYS
+  local out
+  out=$(find "$1" \( -name node_modules -o -name .git -o -name .next -o -name .venv \) -prune -o -type f -mtime -"$NODE_MODULES_IDLE_DAYS" -print -quit 2>/dev/null) || return 1
+  [ -z "$out" ]
+}
+clean_idle_node_modules() {  # opt-in: node_modules in projects untouched for N days (npm install restores)
+  [ "${NODE_MODULES_IDLE_DAYS:-0}" -gt 0 ] || return 0
+  [ "${#PROJECT_DIRS[@]}" -gt 0 ] || return 0
+  local busy nm proj anc host tracked
+  busy=$(busy_dirs)
+  while IFS= read -r nm; do
+    proj=$(dirname "$nm")
+    [ -f "$proj/package.json" ] || continue
+    is_busy "$proj" "$busy" && continue
+    idle_project "$proj" || continue
+    if in_git_repo "$proj"; then                                           # committed to git? keep it
+      tracked=$(git -C "$proj" ls-files node_modules 2>/dev/null) || continue  # git failed: don't guess
+      [ -n "$tracked" ] && continue
+    fi
+    # Inside a larger JS project (workspace package)? Then that project must be idle too.
+    host=""; anc=$(dirname "$proj")
+    while in_project_dirs "$anc"; do
+      if [ -f "$anc/package.json" ] || [ -f "$anc/pnpm-workspace.yaml" ]; then host=$anc; break; fi
+      anc=$(dirname "$anc")
+    done
+    if [ -n "$host" ]; then is_busy "$host" "$busy" && continue; idle_project "$host" || continue; fi
+    zap "$nm" "node_modules, project idle ${NODE_MODULES_IDLE_DAYS}d+ (npm install restores)"
+  done < <(find "${PROJECT_DIRS[@]}" -type d -name node_modules -prune 2>/dev/null)
+}
+subdirs() { find "$1" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null; }
+all_but_newest() {  # stdin: version names; prints all except the newest KEEP_BROWSERS
+  sort -V | awk -v k="$KEEP_BROWSERS" '{a[NR]=$0} END{for(i=1;i<=NR-k;i++) print a[i]}'
+}
+clean_old_browsers() {  # headless browser builds downloaded by Puppeteer / Playwright; keep newest N
+  local group dir flavour v
+  for group in "$HOME"/.cache/puppeteer/*; do
+    [ -d "$group" ] && [ ! -L "$group" ] || continue
+    case "${group##*/}" in chrome|chrome-headless-shell|chromium|chromedriver|firefox) ;; *) continue ;; esac
+    while IFS= read -r v; do zap "$group/$v" "old Puppeteer browser build"; done < <(subdirs "$group" | all_but_newest)
+  done
+  for dir in "$HOME/Library/Caches/ms-playwright" "$HOME/.cache/ms-playwright"; do
+    [ -d "$dir" ] || continue
+    while IFS= read -r flavour; do
+      while IFS= read -r v; do
+        zap "$dir/$v" "old Playwright browser build"
+      done < <(subdirs "$dir" | grep -E "^${flavour}-[0-9]+$" | all_but_newest)
+    done < <(subdirs "$dir" | grep -E -- '^(chromium|chromium_headless_shell|chromium-headless-shell|chromium_tip_of_tree|firefox|firefox-beta|webkit|ffmpeg|winldd|android)-[0-9]+$' | sed -E 's/-[0-9]+$//' | sort -u)
+  done
+}
+clean_dev_misc() {
+  local f
+  if [ "${DERIVED_DATA_DAYS:-0}" -gt 0 ]; then
+    while IFS= read -r f; do zap "$f" "Xcode DerivedData, idle ${DERIVED_DATA_DAYS}d+"
+    done < <(find "$HOME/Library/Developer/Xcode/DerivedData" -mindepth 1 -maxdepth 1 -mtime +"$DERIVED_DATA_DAYS" 2>/dev/null)
+  fi
+  if [ "$DRY" = 1 ]; then
+    command -v xcrun >/dev/null 2>&1 && printf "  %9s  %s\n" "?" "unavailable iOS simulators: $(xcrun simctl list devices 2>/dev/null | grep -c '(unavailable')"
+    printf "  %9s  %s\n" "?" "uv / pnpm package-cache prune (unused entries only)"
+  else
+    command -v xcrun >/dev/null 2>&1 && xcrun simctl delete unavailable >/dev/null 2>&1 && log "deleted unavailable iOS simulators"
+    command -v uv >/dev/null 2>&1 && uv cache prune >/dev/null 2>&1 && log "uv cache prune"
+    command -v pnpm >/dev/null 2>&1 && pnpm store prune >/dev/null 2>&1 && log "pnpm store prune"
+  fi
+}
+
+clean_all() {
+  [ "$DRY" = 1 ] && echo "Safe, rebuildable caches:"
+  clean_next_caches; clean_idle_node_modules; clean_old_browsers; clean_dev_misc
+  # npm/bun download caches only at the block level (they slow the next install).
+  if [ "$(state)" = CRITICAL ]; then
+    if [ "$DRY" = 1 ]; then echo "  (CRITICAL) npm + bun download caches"
+    else
+      command -v npm >/dev/null 2>&1 && npm cache clean --force >/dev/null 2>&1
+      command -v bun >/dev/null 2>&1 && bun pm cache rm >/dev/null 2>&1
+      log "cleared npm/bun download caches (CRITICAL)"
+    fi
+  fi
+  return 0
+}
+
+report() {
+  echo "Never deleted automatically — review these yourself:"
+  local p
+  for p in "$HOME/Library/Developer/Xcode/Archives" "$HOME/Library/Developer/Xcode/iOS DeviceSupport" \
+           "$HOME/Library/Developer/CoreSimulator/Devices" "$HOME/.android/avd" "$HOME/Library/Android" \
+           "$HOME/.cache/huggingface" "$HOME/.ollama/models" "$HOME/Library/Containers/com.docker.docker" \
+           "$HOME/Downloads" "$HOME/.Trash"; do
+    [ -e "$p" ] && printf "  %8s  %s\n" "$(du -sh "$p" 2>/dev/null | cut -f1)" "${p/#$HOME/~}"
+  done
+  local r
+  for r in "${PROJECT_DIRS[@]}"; do
+    echo; echo "Biggest folders in ${r/#$HOME/~}:"
+    du -xsh "$r"/*/ 2>/dev/null | sort -rh | head -8 | sed "s|$HOME|~|; s/^/  /"
+  done
+}
+
+notify() {  # rate-limited desktop notification: notify <key> <minutes> <message>
+  local stamp="$STATE_DIR/disk-notify-$1" now; now=$(date +%s)
+  if [ $((now - $(read_stamp "$stamp"))) -lt $(($2 * 60)) ]; then return; fi
+  echo "$now" > "$stamp"
+  if command -v osascript >/dev/null 2>&1; then
+    osascript -e "display notification \"$3\" with title \"diskguard\"" >/dev/null 2>&1
+  elif command -v notify-send >/dev/null 2>&1; then
+    notify-send diskguard "$3" >/dev/null 2>&1
+  fi
+}
+due() {  # due <key> <minutes>: true (and stamps) if at least <minutes> since last time
+  local stamp="$STATE_DIR/disk-due-$1" now; now=$(date +%s)
+  if [ $((now - $(read_stamp "$stamp"))) -lt $(($2 * 60)) ]; then return 1; fi
+  echo "$now" > "$stamp"
+}
+json_str() { python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$1" 2>/dev/null || { local s=$1; s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\t'/\\t}; s=${s//$'\n'/\\n}; s=${s//$'\r'/}; printf '"%s"' "$s"; }; }
+read_stamp() { local v; v=$(cat "$1" 2>/dev/null); case "$v" in ''|*[!0-9]*) echo 0 ;; *) echo "$v" ;; esac; }
+# read_hook: sets TOOL and CMD from the hook JSON on stdin
+read_hook() { local input; input=$(cat); TOOL=$(printf '%s' "$input" | json_get tool_name); CMD=$(printf '%s' "$input" | json_get tool_input.command); }
+# ---- command matching (shared by memguard and diskguard; keep both copies identical) ----
+# segments <command> <override-var>: prints one simple command per line, normalised for matching.
+#  - splits on ; && || | & ( ) { } and newlines, but never inside quotes or comments
+#  - skips heredoc bodies (unless they're fed to a shell), so commit messages and notes don't count
+#  - drops leading VAR=x, sudo/env/time/nohup/nice/timeout/caffeinate/xargs/watch/arch, then/do/else/!
+#  - "bash -c '...'" and "eval '...'" are unwrapped and checked too
+#  - quoted text is blanked and redirections like 2>/dev/null are removed
+#  - a segment that starts with <override-var>=1 is dropped (that's the per-command override);
+#    "export <override-var>=1" drops everything after it
+segments() {
+  local depth=${3:-0} line
+  [ "$depth" -gt 3 ] && return
+  printf '%s\n' "${1:0:65536}" | awk -v sq="'" -v ov="$2" '
+  function strip_prefixes(s,   again) {
+    again = 1
+    while (again) {
+      again = 0
+      if (match(s, "^[A-Za-z_][A-Za-z0-9_]*=(\"[^\"]*\"|" sq "[^" sq "]*" sq "|[^ ]*)( |$)")) {
+        if (substr(s, 1, RLENGTH) ~ ("^" ov "=1( |$)")) overridden = 1
+        s = substr(s, RLENGTH + 1); again = 1; continue
+      }
+      if (match(s, /^(sudo|env)( -[^ ]+)* /) || match(s, /^(time|nohup|exec|command|builtin|then|do|else|!) /) ||
+          match(s, /^nice( -n ?-?[0-9]+| -[0-9]+)? /) || match(s, /^timeout( -[^ ]+)* [0-9.]+[smhd]? /) ||
+          match(s, /^caffeinate( -[a-z]+)* /) || match(s, /^xargs( -[IinPLsdE] [^- ][^ ]*| -[0-9A-Za-z]+)* /) ||
+          match(s, /^watch( -n ?[0-9.]+| -[a-z]+)* /) || match(s, /^arch -[a-z0-9_]+ /) || match(s, /^stdbuf( -[^ ]+)* /)) {
+        s = substr(s, RLENGTH + 1); again = 1
+      }
+    }
+    return s
+  }
+  function emit(s,   sp, w, rest, inner) {
+    gsub(/[ \t]+/, " ", s); sub(/^ /, "", s); sub(/ $/, "", s)
+    overridden = 0
+    if (s ~ ("^export " ov "=1( |$)")) { all_off = 1; return }
+    s = strip_prefixes(s)
+    if (overridden || all_off || s == "") return
+    # bash -c "..." / sh -c / zsh -lc / eval "...": check what runs inside
+    if (match(s, /^(\/[^ ]*\/)?(ba|z|da|k)?sh( -[a-z]+)* -[a-z]*c /) || match(s, /^eval /)) {
+      inner = substr(s, RLENGTH + 1)
+      if (inner ~ ("^[\"" sq "]")) { q1 = substr(inner, 1, 1); inner = substr(inner, 2); sub("[" q1 "][^" q1 "]*$", "", inner) }
+      gsub(/\n/, " ", inner); print "@@R " inner; return
+    }
+    # blank quoted text, drop redirections that do not write big files
+    gsub("\"[^\"]*\"", "\"\"", s); gsub(sq "[^" sq "]*" sq, sq sq, s)
+    gsub(/ ?[0-9]*>&[0-9-]+/, "", s); gsub(/ ?([0-9]*|&)>>? ?\/dev\/null/, "", s); gsub(/ ?2>>? ?[^ ]+/, "", s)
+    gsub(/ -[A-Za-z]*[oO] ?(\/dev\/null|-)( |$)/, " ", s); gsub(/ --output[ =](\/dev\/null|-)( |$)/, " ", s)
+    sub(/ $/, "", s)
+    sp = index(s, " "); w = (sp ? substr(s, 1, sp - 1) : s); rest = (sp ? substr(s, sp) : "")
+    sub(/.*\//, "", w); print w rest
+  }
+  { gsub(/\r/, ""); lines[++nl] = $0 }
+  END {
+    # pass 1: drop heredoc bodies unless a shell reads them
+    buf = ""
+    for (i = 1; i <= nl; i++) {
+      l = lines[i]; buf = buf (buf == "" && i == 1 ? "" : "\n") l
+      if (match(l, "<<-?[ \t]*[\"" sq "]?[A-Za-z_][A-Za-z0-9_]*[\"" sq "]?") && substr(l, RSTART + 2, 1) != "<") {
+        d = substr(l, RSTART, RLENGTH); dash = (d ~ /^<<-/); gsub(/^<<-?[ \t]*/, "", d); gsub("[\"" sq "]", "", d)
+        keep = (l ~ /(^|[;&|( ]|\/)(ba|z|da|k)?sh( |$)/)
+        for (i++; i <= nl; i++) {
+          b = lines[i]; t = b; if (dash) sub(/^\t+/, "", t)
+          if (t == d) break
+          if (keep) buf = buf "\n" b
+        }
+      }
+    }
+    # pass 2: split outside quotes and comments
+    q = ""; cur = ""; n = length(buf)
+    for (i = 1; i <= n; i++) {
+      c = substr(buf, i, 1)
+      if (q != "") {
+        if (c == q) q = ""
+        else if (c == "\\" && q == "\"") { cur = cur c substr(buf, i + 1, 1); i++; continue }
+        else if (c == "\n") c = " "
+        cur = cur c; continue
+      }
+      if (c == sq || c == "\"") { q = c; cur = cur c; continue }
+      if (c == "\\") { nx = substr(buf, i + 1, 1); cur = cur (nx == "\n" ? " " : nx); i++; continue }
+      if (c == "#" && (cur == "" || substr(cur, length(cur), 1) ~ /[ \t]/)) { while (i < n && substr(buf, i + 1, 1) != "\n") i++; continue }
+      if (c == "$" && substr(buf, i + 1, 1) == "(") { emit(cur); cur = ""; i++; continue }
+      if (index(";&|(){}`\n", c)) { emit(cur); cur = ""; continue }
+      cur = cur c
+    }
+    emit(cur)
+  }' | while IFS= read -r line; do
+    case "$line" in "@@R "*) segments "${line#@@R }" "$2" $((depth + 1)) ;; *) printf '%s\n' "$line" ;; esac
+  done
+}
+# Global flags allowed between a tool and its verb, e.g. npm --prefix web install, git -C dir clone.
+GF='( -[^ ]+( [^- ][^ ]*)?)*'
+# Read-only forms of heavy tools: version/help/dry-run/listing never count.
+LIGHT_RE='^[^ ]+( [^ -][^ ]*)? (-v|-V|--version|-version|--help|-h|-help)$| --dry-run( |$)|^(make (-n|--dry-run|clean|help)|unzip -[lZ]|git lfs (ls-files|status|env|version)|xcodebuild -(list|showsdks|version)|gradlew? (tasks|--version)|uv pip (list|show|freeze)|pip[0-9.]* (list|show|freeze)|npx kill-port|docker compose (down|stop|ps|logs|config|ls)|docker-compose (down|stop|ps|logs|config))( |$)'
+# is_heavy <command> <heavy-regex> <override-var>
+is_heavy() {
+  segments "$1" "$3" | sort -u | grep -E -- "$2" | grep -Evq -- "$LIGHT_RE"
+}
+# Commands that write lots of data. Only checked when free space is below a limit.
+HEAVY_RE="^(ffmpeg|npm$GF (install|i|ci|add|update|create|init|x|exec|run build)|pnpm$GF (install|add|i|update|build|run build|create|dlx)|yarn$GF (add|install|build|create|dlx)|yarn workspace [^ ]+ (add|install|build)|bun$GF (install|add|i|build|run build|create|x)|bunx|pip[0-9.]*$GF install|python[0-9.]*$GF -m pip install|poetry install|uv (pip (install|sync)|sync|add|run)|uvx|git$GF clone|git$GF lfs (pull|fetch|clone)|gh repo clone|wget|docker (pull|build|run|compose (up|build|run|pull|create)|buildx build)|docker-compose (up|build|run|pull|create)|xcodebuild|gradlew?|brew (install|upgrade|reinstall)|huggingface-cli|hf download|npx|remotion|cargo (build|install)|next build|cp -[A-Za-z]*[rRa]|rsync|unzip|ditto|tar (-?[A-Za-z]*x[A-Za-z]*|--extract))( |$)|^curl(.* )?-[A-Za-z]*[oO]|^curl .*(--output|--remote-name| >)|^yarn$"
+
+case "${1:-status}" in
+  status)
+    summary
+    echo "Config: $CONFIG$([ -f "$CONFIG" ] || echo ' (not created yet, using defaults)')"
+    echo; echo "Cleanup preview (what 'diskguard clean' would remove):"
+    DRY=1; clean_all
+    echo "  -> total reclaimable: $(human "$FREED_KB")"
+    echo; echo "Run 'diskguard report' for big folders that are never deleted automatically."
+    ;;
+  check)  s=$(state); echo "$s"; [ "$s" = OK ] && exit 0; [ "$s" = WARN ] && exit 1; exit 2 ;;
+  json)
+    printf '{"level":"%s","free_gb":%s,"total_gb":%s,"free_pct":%s,"unit":"%s","warn_free":%s,"block_free":%s,"config":%s}\n' \
+      "$(state)" "$(free_gb)" "$(total_gb)" "$(free_pct)" "$UNIT" "$WARN" "$BLOCK" "$(json_str "$CONFIG")"
+    ;;
+  clean)
+    [ $# -gt 2 ] && { echo "diskguard clean: too many options (use -n or --dry-run to preview)" >&2; exit 64; }
+    [ $# -eq 2 ] && [ -z "$2" ] && { echo "diskguard clean: empty option" >&2; exit 64; }
+    case "$2" in
+      "") ;;
+      -n|--dry-run) DRY=1 ;;
+      *) echo "diskguard clean: unknown option '$2' (use -n or --dry-run to preview)" >&2; exit 64 ;;
+    esac
+    before=$(free_gb); clean_all
+    if [ "$DRY" = 1 ]; then echo "total: $(human "$FREED_KB")"
+    else log "clean: $before GB -> $(free_gb) GB free"; echo "freed $(( $(free_gb) - before )) GB — $(summary)"; fi
+    ;;
+  report) summary; echo; report ;;
+  hook)
+    [ -n "$DISKGUARD_OFF" ] && exit 0
+    s=$(state); [ "$s" = OK ] && exit 0
+    read_hook
+    [ -z "$CMD" ] && exit 0
+    case "$TOOL" in ""|Bash) ;; *) exit 0 ;; esac
+    cmd=$CMD
+    is_heavy "$cmd" "$HEAVY_RE" DISKGUARD_OVERRIDE || exit 0
+    if [ "$s" = CRITICAL ]; then
+      log "hook: blocked [$(echo "$cmd" | head -1 | cut -c1-120)] — $(summary)"
+      cat >&2 <<EOF
+diskguard BLOCKED this command: $(summary).
+Writing more data now risks filling the disk. Before retrying:
+  1. Run $G/diskguard status (and $G/diskguard report) to see what is using space.
+  2. Delete intermediate files your task created; run $G/diskguard clean for safe caches.
+  3. Tell the user what is filling the disk. Only if the user explicitly says to proceed anyway, prefix the command with DISKGUARD_OVERRIDE=1.
+EOF
+      exit 2
+    fi
+    if due hook-warn 30; then
+      msg="diskguard WARNING — $(summary). Keep outputs small: delete intermediate files after the final output exists, don't keep many variants, and avoid large downloads. Suggest $G/diskguard clean to the user if space keeps dropping."
+      printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":%s}}\n' "$(json_str "$msg")"
+    fi
+    exit 0
+    ;;
+  watch)
+    [ -n "$CONFIG_BROKEN" ] && log "settings file $CONFIG can't be read: automatic cleanup is off" &&
+      notify config 720 "Settings file can't be read, so automatic cleanup is off. Run: agent-guards settings"
+    s=$(state)
+    # Daily cleanup, plus extra runs when space is low (only if auto cleanup is on).
+    if [ "$AUTO_CLEAN" = 1 ]; then
+      if due daily 1440 || { [ "$s" != OK ] && due low-space 360; } || { [ "$s" = CRITICAL ] && due critical 30; }; then
+        before=$(free_gb); clean_all
+        log "watch ($s): cleanup $before GB -> $(free_gb) GB free"
+      fi
+    fi
+    s=$(state)
+    [ "$s" = CRITICAL ] && notify critical 30 "Disk CRITICAL: $(free_gb) GB free. Run: $G/diskguard report"
+    [ "$s" = WARN ] && notify warn 720 "Disk space low: $(free_gb) GB free. Run: $G/diskguard report"
+    [ -f "$LOG" ] && [ "$(wc -l < "$LOG")" -gt 5000 ] && tail -2000 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+    exit 0
+    ;;
+  -h|--help|help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 64 ;;
+esac

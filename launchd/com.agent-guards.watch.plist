@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Optional watchdog. Install with: agent-guards watchdog install
+     (it fills in the placeholders below and loads this into launchd). -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agent-guards.watch</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__AGENT_GUARDS_BIN__/agent-guards</string>
+    <string>watch</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AGENT_GUARDS_CONFIG</key>
+    <string>__AGENT_GUARDS_CONFIG__</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>600</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>Nice</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/dev/null</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.local/state/agent-guards/watchdog.err</string>
+</dict>
+</plist>

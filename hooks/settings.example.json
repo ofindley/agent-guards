@@ -1,0 +1,13 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "~/.claude/skills/agent-guards/bin/memguard hook" },
+          { "type": "command", "command": "~/.claude/skills/agent-guards/bin/diskguard hook" }
+        ]
+      }
+    ]
+  }
+}

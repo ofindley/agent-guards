@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Guards</title>
+<style>
+:root {
+  --bg: #f6f6f4; --card: #ffffff; --text: #1b1b1a; --muted: #6b6a66; --line: #e4e3df;
+  --field: #fbfbfa; --accent: #2f6fde; --accent-text: #ffffff;
+  --ok: #1f8a4c; --warn: #b7791f; --crit: #c8382f;
+  --ok-bg: #e5f4ea; --warn-bg: #fbf0dc; --crit-bg: #fbe4e2;
+  --zone-ok: #d6eedd; --zone-warn: #f6dfb3; --zone-crit: #f3c1bc;
+  --shadow: 0 1px 2px rgba(0,0,0,.04), 0 4px 16px rgba(0,0,0,.04);
+  --radius: 14px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #121212; --card: #1c1c1b; --text: #ecebe8; --muted: #9a9893; --line: #2e2d2b;
+    --field: #232322; --accent: #6b9cff; --accent-text: #0d1424;
+    --ok: #5cc98a; --warn: #e3ae55; --crit: #f07b70;
+    --ok-bg: #173123; --warn-bg: #3a2c12; --crit-bg: #3d1c19;
+    --zone-ok: #1f3a2a; --zone-warn: #4a3712; --zone-crit: #4d211d;
+    --shadow: none;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--bg); color: var(--text);
+  font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+main { max-width: 760px; margin: 0 auto; padding: 32px 16px 120px; }
+header h1 { font-size: 24px; margin: 0 0 4px; letter-spacing: -.01em; }
+header p { margin: 0 0 24px; color: var(--muted); }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); padding: 20px; margin-bottom: 16px; }
+.card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 4px; flex-wrap: wrap; }
+.card h2 { font-size: 17px; margin: 0; }
+.sub { color: var(--muted); font-size: 13px; margin: 0 0 16px; }
+.reading { display: flex; align-items: baseline; gap: 8px; margin: 8px 0 10px; flex-wrap: wrap; }
+.reading .big { font-size: 30px; font-weight: 650; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+.reading .small { color: var(--muted); font-size: 13px; }
+.chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 999px; letter-spacing: .02em; white-space: nowrap; }
+.chip::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.chip.OK { color: var(--ok); background: var(--ok-bg); }
+.chip.WARN { color: var(--warn); background: var(--warn-bg); }
+.chip.CRITICAL { color: var(--crit); background: var(--crit-bg); }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip-label { font-weight: 500; opacity: .85; }
+
+/* zone bar: coloured zones + a needle at the current reading */
+.bar { position: relative; height: 12px; border-radius: 999px; overflow: hidden; display: flex; background: var(--zone-ok); }
+.bar span { height: 100%; }
+.needle-wrap { position: relative; height: 0; }
+.needle { position: absolute; top: -17px; width: 3px; height: 22px; margin-left: -1.5px; border-radius: 2px; background: var(--text); box-shadow: 0 0 0 2px var(--card); transition: left .3s; }
+.scale { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; margin: 6px 0 18px; font-variant-numeric: tabular-nums; }
+
+.row { display: grid; grid-template-columns: 150px 1fr auto; align-items: center; gap: 14px; padding: 10px 0; border-top: 1px solid var(--line); }
+.row:first-of-type { border-top: 0; }
+.row label, .row .lbl { font-weight: 550; }
+.row .hint { display: block; font-weight: 400; color: var(--muted); font-size: 12px; }
+.num { display: inline-flex; align-items: center; height: 38px; border: 1px solid var(--line); border-radius: 10px; background: var(--field); overflow: hidden; }
+.num:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent); }
+.num input { width: 64px; height: 100%; border: 0; background: transparent; color: var(--text); font: inherit; font-variant-numeric: tabular-nums; text-align: right; padding: 0 4px 0 10px; outline: none; -moz-appearance: textfield; }
+.num input::-webkit-outer-spin-button, .num input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.num .unit { color: var(--muted); font-size: 13px; padding: 0 10px 0 2px; min-width: 42px; }
+.text { width: 100%; height: 38px; border: 1px solid var(--line); border-radius: 10px; background: var(--field); color: var(--text); font: inherit; padding: 0 12px; outline: none; }
+.text:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent); }
+
+input[type=range] { -webkit-appearance: none; appearance: none; width: 100%; height: 22px; background: transparent; margin: 0; }
+input[type=range]::-webkit-slider-runnable-track { height: 6px; border-radius: 999px; background: var(--line); }
+input[type=range]::-moz-range-track { height: 6px; border-radius: 999px; background: var(--line); }
+input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 20px; height: 20px; margin-top: -7px; border-radius: 50%; background: var(--card); border: 2px solid var(--thumb, var(--accent)); box-shadow: 0 1px 3px rgba(0,0,0,.2); cursor: pointer; }
+input[type=range]::-moz-range-thumb { width: 16px; height: 16px; border-radius: 50%; background: var(--card); border: 2px solid var(--thumb, var(--accent)); cursor: pointer; }
+input[type=range]:focus-visible { outline: none; }
+input[type=range]:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 4px color-mix(in srgb, var(--thumb, var(--accent)) 30%, transparent); }
+.r-warn { --thumb: var(--warn); }
+.r-crit { --thumb: var(--crit); }
+
+/* segmented control (instead of a native select) */
+.seg { display: inline-flex; padding: 3px; gap: 2px; border: 1px solid var(--line); border-radius: 10px; background: var(--field); }
+.seg button { border: 0; background: transparent; color: var(--muted); font: inherit; font-size: 13px; font-weight: 550; padding: 6px 12px; border-radius: 7px; cursor: pointer; }
+.seg button[aria-checked=true] { background: var(--card); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.12); }
+.seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* switch */
+.switch { position: relative; width: 44px; height: 26px; border-radius: 999px; border: 0; background: var(--line); cursor: pointer; padding: 0; flex: none; transition: background .15s; }
+.switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 20px; height: 20px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.25); transition: transform .15s; }
+.switch[aria-checked=true] { background: var(--accent); }
+.switch[aria-checked=true]::after { transform: translateX(18px); }
+.switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+body:not(.ready) .switch, body:not(.ready) .switch::after, body:not(.ready) .needle { transition: none; }
+.card, .foot { transition: opacity .2s; }
+body:not(.ready) .card, body:not(.ready) .foot { opacity: 0; }
+.toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 0; border-top: 1px solid var(--line); }
+.toggle-row .lbl { font-weight: 550; }
+.toggle-row .hint { display: block; font-weight: 400; color: var(--muted); font-size: 12px; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 24px; }
+.field { padding: 10px 0; border-top: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.field .lbl { font-weight: 550; font-size: 14px; }
+.field .hint { display: block; font-weight: 400; color: var(--muted); font-size: 12px; }
+.field-full { padding: 10px 0; border-top: 1px solid var(--line); }
+.field-full .lbl { font-weight: 550; font-size: 14px; display: block; margin-bottom: 6px; }
+
+.savebar { position: fixed; left: 0; right: 0; bottom: 0; background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(8px); border-top: 1px solid var(--line); }
+.savebar .in { max-width: 760px; margin: 0 auto; padding: 12px 16px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.msg { font-size: 13px; color: var(--muted); min-width: 0; }
+.msg.err { color: var(--crit); }
+.msg.good { color: var(--ok); }
+.btn { border: 0; border-radius: 10px; background: var(--accent); color: var(--accent-text); font: inherit; font-weight: 600; padding: 10px 22px; cursor: pointer; flex: none; }
+.btn:disabled { opacity: .45; cursor: default; }
+.btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--field); border: 1px solid var(--line); border-radius: 6px; padding: 1px 5px; word-break: break-all; }
+.foot { color: var(--muted); font-size: 12px; margin-top: 8px; }
+
+@media (max-width: 600px) {
+  main { padding-top: 22px; }
+  .row { grid-template-columns: 1fr auto; gap: 6px 12px; }
+  .row input[type=range] { grid-column: 1 / -1; grid-row: 2; }
+  .grid2 { grid-template-columns: 1fr; }
+  .reading .big { font-size: 26px; }
+}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Agent Guards</h1>
+    <p>Pick when your agents get a warning and when heavy commands are blocked.</p>
+  </header>
+
+  <section class="card" aria-labelledby="mem-h">
+    <div class="card-head">
+      <h2 id="mem-h">Memory</h2>
+      <div class="chips"><span class="chip" id="mem-now">…</span></div>
+    </div>
+    <div class="reading"><span class="big" id="mem-used">–</span><span class="small" id="mem-detail">used</span></div>
+    <div class="bar" id="mem-bar" aria-hidden="true"></div>
+    <div class="needle-wrap"><div class="needle" id="mem-needle"></div></div>
+    <div class="scale"><span>0%</span><span>memory used</span><span>100%</span></div>
+
+    <div class="row">
+      <label for="mem-warn-r">Warn at<span class="hint">agents get a reminder</span></label>
+      <input type="range" class="r-warn" id="mem-warn-r" min="10" max="99" step="1">
+      <span class="num"><input type="number" id="mem-warn" min="10" max="99" step="1" inputmode="numeric"><span class="unit">%</span></span>
+    </div>
+    <div class="row">
+      <label for="mem-block-r">Block at<span class="hint">heavy commands stop</span></label>
+      <input type="range" class="r-crit" id="mem-block-r" min="10" max="99" step="1">
+      <span class="num"><input type="number" id="mem-block" min="10" max="99" step="1" inputmode="numeric"><span class="unit">%</span></span>
+    </div>
+    <div class="toggle-row">
+      <span class="lbl" id="press-l">Also use macOS memory pressure<span class="hint">Warn or block early when macOS itself reports pressure, whatever the % says.</span></span>
+      <button class="switch" role="switch" aria-labelledby="press-l" id="mem-pressure"></button>
+    </div>
+  </section>
+
+  <section class="card" aria-labelledby="disk-h">
+    <div class="card-head">
+      <h2 id="disk-h">Disk</h2>
+      <div class="chips"><span class="chip" id="disk-now">…</span></div>
+    </div>
+    <div class="reading"><span class="big" id="disk-free">–</span><span class="small" id="disk-detail">free</span></div>
+    <div class="bar" id="disk-bar" aria-hidden="true"></div>
+    <div class="needle-wrap"><div class="needle" id="disk-needle"></div></div>
+    <div class="scale"><span>0</span><span>free space</span><span id="disk-max">–</span></div>
+
+    <div class="toggle-row" style="border-top:0">
+      <span class="lbl" id="unit-l">Set limits in</span>
+      <div class="seg" role="radiogroup" aria-labelledby="unit-l" id="disk-unit">
+        <button type="button" role="radio" data-v="gb">GB free</button>
+        <button type="button" role="radio" data-v="pct">% of disk free</button>
+      </div>
+    </div>
+    <div class="row">
+      <label for="disk-warn-r">Warn below<span class="hint">agents keep outputs small</span></label>
+      <input type="range" class="r-warn" id="disk-warn-r" min="0" step="1">
+      <span class="num"><input type="number" id="disk-warn" min="0" step="1" inputmode="numeric"><span class="unit" data-unit>GB</span></span>
+    </div>
+    <div class="row">
+      <label for="disk-block-r">Block below<span class="hint">installs, renders, downloads stop</span></label>
+      <input type="range" class="r-crit" id="disk-block-r" min="0" step="1">
+      <span class="num"><input type="number" id="disk-block" min="0" step="1" inputmode="numeric"><span class="unit" data-unit>GB</span></span>
+    </div>
+  </section>
+
+  <section class="card" aria-labelledby="clean-h">
+    <div class="card-head"><h2 id="clean-h">Cleanup</h2></div>
+    <p class="sub">Only caches that tools rebuild on their own. Your files, code and media are never touched.</p>
+    <div class="toggle-row" style="border-top:0">
+      <span class="lbl" id="auto-l">Watchdog cleans automatically<span class="hint">Daily, and more often when space is low. Needs the optional watchdog.</span></span>
+      <button class="switch" role="switch" aria-labelledby="auto-l" id="auto-clean"></button>
+    </div>
+    <div class="field-full">
+      <label class="lbl" for="proj-dirs">Project folders to scan for build caches</label>
+      <input class="text" id="proj-dirs" spellcheck="false" autocomplete="off">
+    </div>
+    <div class="grid2">
+      <div class="field"><label class="lbl" for="next-days">Next.js .next caches<span class="hint">remove when idle for</span></label><span class="num"><input type="number" id="next-days" min="1" max="365"><span class="unit">days</span></span></div>
+      <div class="field"><label class="lbl" for="dd-days">Xcode DerivedData<span class="hint">remove when idle for (0 = off)</span></label><span class="num"><input type="number" id="dd-days" min="0" max="365"><span class="unit">days</span></span></div>
+      <div class="field"><label class="lbl" for="nm-days">node_modules<span class="hint">in idle projects (0 = off)</span></label><span class="num"><input type="number" id="nm-days" min="0" max="365"><span class="unit">days</span></span></div>
+      <div class="field"><label class="lbl" for="keep-br">Headless browsers<span class="hint">versions to keep</span></label><span class="num"><input type="number" id="keep-br" min="1" max="10"><span class="unit">kept</span></span></div>
+      <div class="field"><label class="lbl" for="orph-min">Orphaned dev servers<span class="hint">stop at block level after</span></label><span class="num"><input type="number" id="orph-min" min="1" max="10080"><span class="unit">min</span></span></div>
+      <div class="field"><label class="lbl" for="stale-min">…and always after<span class="hint">0 = never</span></label><span class="num"><input type="number" id="stale-min" min="0" max="10080"><span class="unit">min</span></span></div>
+    </div>
+  </section>
+
+  <p class="foot">Saved to <code id="cfg-path">…</code>. Environment variables still override this file.</p>
+</main>
+
+<div class="savebar"><div class="in">
+  <span class="msg" id="msg" role="status" aria-live="polite">Loading…</span>
+  <button class="btn" id="save" disabled>Save</button>
+</div></div>
+
+<script>
+const TOKEN = "__TOKEN__";
+const $ = id => document.getElementById(id);
+let saved = null, read = null, dirty = false;
+const cfg = { memory: {}, disk: {}, cleanup: {} };
+
+function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
+function diskMax() {
+  if (cfg.disk.unit === 'pct') return 50;
+  return Math.max(10, Math.round(read?.diskguard?.total_gb || 500));
+}
+function memLevel(used) {
+  const m = cfg.memory;
+  const p = m.use_macos_pressure ? (read?.memguard?.pressure || 1) : 1;
+  if (p >= 4 || used >= m.block_used_pct) return 'CRITICAL';
+  if (p >= 2 || used >= m.warn_used_pct) return 'WARN';
+  return 'OK';
+}
+function diskFree() {
+  const d = read?.diskguard; if (!d) return 0;
+  return cfg.disk.unit === 'pct' ? d.free_pct : d.free_gb;
+}
+function diskLevel() {
+  const f = diskFree();
+  if (f < cfg.disk.block_free) return 'CRITICAL';
+  if (f < cfg.disk.warn_free) return 'WARN';
+  return 'OK';
+}
+const words = { OK: 'OK', WARN: 'Warn', CRITICAL: 'Blocking' };
+function chip(el, level, label) { el.className = 'chip ' + level; el.innerHTML = (label ? '<span class="chip-label">' + label + '</span> ' : '') + words[level]; }
+
+function zones(el, parts) {
+  el.innerHTML = parts.map(([w, c]) => `<span style="width:${Math.max(0, w)}%;background:var(${c})"></span>`).join('');
+}
+
+function render() {
+  const m = cfg.memory, d = cfg.disk, c = cfg.cleanup;
+  // memory
+  $('mem-warn').value = $('mem-warn-r').value = m.warn_used_pct;
+  $('mem-block').value = $('mem-block-r').value = m.block_used_pct;
+  $('mem-pressure').setAttribute('aria-checked', !!m.use_macos_pressure);
+  zones($('mem-bar'), [[m.warn_used_pct, '--zone-ok'], [m.block_used_pct - m.warn_used_pct, '--zone-warn'], [100 - m.block_used_pct, '--zone-crit']]);
+  // disk
+  const max = diskMax(), u = d.unit === 'pct' ? '%' : 'GB';
+  for (const id of ['disk-warn-r', 'disk-block-r', 'disk-warn', 'disk-block']) $(id).max = max;
+  $('disk-warn').value = $('disk-warn-r').value = d.warn_free;
+  $('disk-block').value = $('disk-block-r').value = d.block_free;
+  document.querySelectorAll('[data-unit]').forEach(e => e.textContent = u);
+  document.querySelectorAll('#disk-unit button').forEach(b => { b.setAttribute('aria-checked', b.dataset.v === d.unit); b.tabIndex = b.dataset.v === d.unit ? 0 : -1; });
+  $('disk-max').textContent = max + (d.unit === 'pct' ? '%' : ' GB');
+  const bp = d.block_free / max * 100, wp = d.warn_free / max * 100;
+  zones($('disk-bar'), [[bp, '--zone-crit'], [wp - bp, '--zone-warn'], [100 - wp, '--zone-ok']]);
+  // cleanup
+  $('auto-clean').setAttribute('aria-checked', !!c.auto_clean);
+  if (document.activeElement !== $('proj-dirs')) $('proj-dirs').value = c.project_dirs;
+  $('next-days').value = c.next_cache_idle_days; $('dd-days').value = c.xcode_derived_data_days;
+  $('nm-days').value = c.node_modules_idle_days; $('keep-br').value = c.keep_browser_versions;
+  $('orph-min').value = m.orphan_min_age_min; $('stale-min').value = m.stale_orphan_age_min;
+  renderReadings();
+}
+
+function renderReadings() {
+  if (!read) return;
+  const mg = read.memguard, dg = read.diskguard;
+  if (mg && !mg.error) {
+    $('mem-used').textContent = mg.used_pct + '%';
+    $('mem-detail').textContent = `used of ${mg.total_gb} GB` + (mg.pressure >= 2 ? ' · macOS reports pressure' : '');
+    $('mem-needle').style.left = clamp(mg.used_pct, 0, 100) + '%';
+    chip($('mem-now'), dirty ? memLevel(mg.used_pct) : mg.level, dirty ? 'With these limits:' : 'Now:');
+  }
+  if (dg && !dg.error) {
+    $('disk-free').textContent = dg.free_gb + ' GB';
+    $('disk-detail').textContent = `free of ${dg.total_gb} GB · ${dg.free_pct}%`;
+    $('disk-needle').style.left = clamp(diskFree() / diskMax() * 100, 0, 100) + '%';
+    chip($('disk-now'), dirty ? diskLevel() : dg.level, dirty ? 'With these limits:' : 'Now:');
+  }
+}
+
+function problems() {
+  const m = cfg.memory, d = cfg.disk;
+  if (!(m.block_used_pct > m.warn_used_pct)) return 'Memory: set Block higher than Warn.';
+  if (!(d.block_free < d.warn_free)) return 'Disk: set Block below Warn.';
+  return '';
+}
+
+function changed() {
+  dirty = JSON.stringify(cfg) !== JSON.stringify(saved);
+  const p = problems();
+  $('save').disabled = !dirty || !!p;
+  const msg = $('msg');
+  msg.className = 'msg' + (p ? ' err' : '');
+  msg.textContent = p || (dirty ? 'Unsaved changes' : 'All changes saved');
+  render();
+}
+
+function bindNum(rangeId, numId, set) {
+  const apply = v => { if (v === '' || isNaN(v)) return; set(Number(v)); changed(); };
+  if (rangeId) $(rangeId).addEventListener('input', e => apply(e.target.value));
+  $(numId).addEventListener('change', e => {
+    const el = e.target; apply(clamp(Number(el.value), Number(el.min), Number(el.max || 1e9)));
+  });
+}
+bindNum('mem-warn-r', 'mem-warn', v => cfg.memory.warn_used_pct = v);
+bindNum('mem-block-r', 'mem-block', v => cfg.memory.block_used_pct = v);
+bindNum('disk-warn-r', 'disk-warn', v => cfg.disk.warn_free = v);
+bindNum('disk-block-r', 'disk-block', v => cfg.disk.block_free = v);
+bindNum(null, 'next-days', v => cfg.cleanup.next_cache_idle_days = v);
+bindNum(null, 'dd-days', v => cfg.cleanup.xcode_derived_data_days = v);
+bindNum(null, 'nm-days', v => cfg.cleanup.node_modules_idle_days = v);
+bindNum(null, 'keep-br', v => cfg.cleanup.keep_browser_versions = v);
+bindNum(null, 'orph-min', v => cfg.memory.orphan_min_age_min = v);
+bindNum(null, 'stale-min', v => cfg.memory.stale_orphan_age_min = v);
+$('proj-dirs').addEventListener('input', e => { cfg.cleanup.project_dirs = e.target.value; changed(); });
+for (const [id, sec, key] of [['mem-pressure', 'memory', 'use_macos_pressure'], ['auto-clean', 'cleanup', 'auto_clean']]) {
+  $(id).addEventListener('click', () => { cfg[sec][key] = !cfg[sec][key]; changed(); });
+}
+
+function setUnit(u) {
+  const d = cfg.disk; if (d.unit === u) return;
+  const total = read?.diskguard?.total_gb || 500;
+  const conv = v => u === 'pct' ? Math.round(v / total * 100) : Math.round(v * total / 100);
+  d.warn_free = conv(d.warn_free); d.block_free = conv(d.block_free); d.unit = u;
+  if (d.unit === 'pct') { d.warn_free = clamp(d.warn_free, 1, 50); d.block_free = clamp(d.block_free, 0, d.warn_free - 1); }
+  changed();
+  document.querySelector(`#disk-unit [data-v="${u}"]`).focus();
+}
+document.querySelectorAll('#disk-unit button').forEach(b => {
+  b.addEventListener('click', () => setUnit(b.dataset.v));
+  b.addEventListener('keydown', e => {
+    if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) { e.preventDefault(); setUnit(cfg.disk.unit === 'gb' ? 'pct' : 'gb'); }
+  });
+});
+
+async function load() {
+  const r = await fetch('/api/state'); const s = await r.json();
+  read = s.readings; $('cfg-path').textContent = s.config_path;
+  if (!saved) { saved = structuredClone(s.config); Object.assign(cfg, structuredClone(s.config)); changed(); requestAnimationFrame(() => requestAnimationFrame(() => document.body.classList.add('ready'))); }
+  else renderReadings();
+}
+
+$('save').addEventListener('click', async () => {
+  $('save').disabled = true;
+  let r, s;
+  try {
+    r = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Token': TOKEN }, body: JSON.stringify(cfg) });
+    s = await r.json();
+  } catch (e) { r = { ok: false }; s = { error: 'Could not save. Is the settings server still running?' }; }
+  if (!r.ok) { $('msg').className = 'msg err'; $('msg').textContent = s.error || 'Could not save'; $('save').disabled = false; return; }
+  saved = structuredClone(s.config); Object.assign(cfg, structuredClone(s.config)); read = s.readings; dirty = false;
+  render();
+  $('msg').className = 'msg good';
+  $('msg').textContent = `Saved. Scripts now report memory ${words[read.memguard.level]}, disk ${words[read.diskguard.level]}.`;
+});
+
+load().catch(() => { $('msg').className = 'msg err'; $('msg').textContent = 'Could not reach the settings server. Is it still running?'; });
+setInterval(() => load().catch(() => {}), 4000);
+</script>
+</body>
+</html>
